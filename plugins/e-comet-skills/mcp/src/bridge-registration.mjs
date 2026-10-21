@@ -46,6 +46,33 @@ const isText = (value) => typeof value === 'string' && value.length > 0;
 const randomHex = () => randomBytes(8).toString('hex');
 // Full paths: Windows searches the working directory, which a host may set to a project folder, before PATH.
 const system32 = (env, name) => win32.join(env.SystemRoot || 'C:\\Windows', 'System32', name);
+const psLiteral = (value) => `'${value.replaceAll("'", "''")}'`;
+
+// A packaged host's child can inherit its private registry view without carrying package identity. StdRegProv writes
+// the current user's physical hive; reading it back through that same provider verifies what the browser can see.
+const writeWindowsRegistration = async ({ env, run, key, manifestPath }) => {
+    const script = [
+        "$ErrorActionPreference='Stop'; $stage='CONNECT'; try {",
+        "$provider=[wmiclass]'\\\\.\\root\\default:StdRegProv';",
+        `$key=${psLiteral(key.slice('HKCU\\'.length))}; $value=${psLiteral(manifestPath)};`,
+        "$stage='CREATE'; $created=$provider.CreateKey([uint32]2147483649,$key);",
+        'if ($created.ReturnValue -ne 0) { [Console]::WriteLine("WMI_CREATE_$($created.ReturnValue)"); return };',
+        "$stage='WRITE'; $written=$provider.SetStringValue([uint32]2147483649,$key,'',$value);",
+        'if ($written.ReturnValue -ne 0) { [Console]::WriteLine("WMI_WRITE_$($written.ReturnValue)"); return };',
+        "$stage='READ'; $read=$provider.GetStringValue([uint32]2147483649,$key,'');",
+        'if ($read.ReturnValue -ne 0) { [Console]::WriteLine("WMI_READ_$($read.ReturnValue)"); return };',
+        "if ($read.sValue -cne $value) { [Console]::WriteLine('WMI_VERIFY_MISMATCH'); return };",
+        "[Console]::WriteLine('OK')",
+        '} catch { [Console]::WriteLine("WMI_$($stage)_HRESULT_$($_.Exception.HResult)") }',
+    ].join(' ');
+    const { stdout } = await run(system32(env, 'WindowsPowerShell\\v1.0\\powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script]);
+    const reply = stdout.replace(/^\uFEFF/, '').trim();
+    if (reply !== 'OK') {
+        const code = /^(?:WMI_(?:CONNECT|CREATE|WRITE|READ)_(?:\d+|HRESULT_-?\d+)|WMI_VERIFY_MISMATCH)$/.test(reply)
+            ? reply : 'REGISTRY_PROVIDER_INVALID_REPLY';
+        throw Object.assign(new Error('Native host registration was not verified'), { code });
+    }
+};
 // Anything but a clear "not there" counts as present, so a guarded folder is attempted and reported, not skipped.
 const exists = (fs, path) => fs.stat(path).then(() => true, (error) => !['ENOENT', 'ENOTDIR'].includes(error?.code));
 // Name and code only: a message can carry a path. `name` is the registration step, which is what support needs.
@@ -381,8 +408,7 @@ export async function ensureRegistration(deps) {
         }
         if (target.key) {
             step = 'RegistryWrite';
-            // Written every time and never read back: reg query output garbles a Cyrillic path.
-            await run(system32(env, 'reg.exe'), ['add', target.key, '/ve', '/t', 'REG_SZ', '/d', manifestPaths[0], '/f']);
+            await writeWindowsRegistration({ env, run, key: target.key, manifestPath: manifestPaths[0] });
         }
 
         // A denied folder may still name a directory this run no longer registers, so nothing is pruned then.
